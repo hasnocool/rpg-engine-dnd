@@ -125,6 +125,46 @@ class AsyncSQLitePlatformStore:
             )
             await db.commit()
 
+    async def compare_and_set_json(
+        self,
+        namespace: str,
+        key: str,
+        expected: dict[str, object] | None,
+        value: dict[str, object],
+    ) -> bool:
+        if not namespace or not key:
+            raise ValueError("namespace and key must not be empty")
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT payload_json FROM platform_json WHERE namespace=? AND key=?",
+                (namespace, key),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            current: dict[str, object] | None = None
+            if row is not None:
+                raw: Any = json.loads(row[0])
+                if not isinstance(raw, dict):
+                    await db.rollback()
+                    raise ValueError("stored platform JSON must be an object")
+                current = raw
+            if current != expected:
+                await db.rollback()
+                return False
+            await db.execute(
+                """
+                INSERT INTO platform_json(namespace, key, payload_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(namespace, key)
+                DO UPDATE SET payload_json=excluded.payload_json, updated_at=CURRENT_TIMESTAMP
+                """,
+                (namespace, key, payload),
+            )
+            await db.commit()
+            return True
+
     async def get_json(self, namespace: str, key: str) -> dict[str, object] | None:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(

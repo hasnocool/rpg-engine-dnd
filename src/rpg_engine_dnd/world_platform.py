@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,6 +15,9 @@ from .knowledge import KnowledgeAuthority
 from .models import World
 from .orchestrator import CampaignOrchestrator
 from .rules import RulesRuntime
+from .runtime import AuthoritativeRuntime, CommandBus, CommandLike
+from .scheduler import SimulationScheduler
+from .semantic_events import SemanticEventJournal
 
 
 class RuleExecuteCommand(BaseModel):
@@ -31,7 +34,15 @@ class RuleExecuteCommand(BaseModel):
 
 
 class WorldPlatformEngine:
-    """Single authority boundary shared by clients, hosting, replay, and rules execution."""
+    """Single atomic authority boundary shared by clients, hosting, replay, and rules execution."""
+
+    _CORE_KINDS = (
+        "entity.create",
+        "entity.delete",
+        "component.set",
+        "component.patch",
+        "component.remove",
+    )
 
     def __init__(self, *, seed: int | str | bytes) -> None:
         self.core = SimulationEngine(seed=seed)
@@ -39,18 +50,58 @@ class WorldPlatformEngine:
         self.compiler = RuleCompiler()
         self.orchestrator = CampaignOrchestrator()
         self.knowledge = KnowledgeAuthority()
+        self.scheduler = SimulationScheduler()
         self.rule_state: dict[str, object] = {}
+        self._rule_results: dict[str, RuleExecutionResult] = {}
+
+        self.command_bus = CommandBus()
+        for kind in self._CORE_KINDS:
+            self.command_bus.register(kind, self._handle_core_command)
+        self.command_bus.register("rule.execute", self._handle_rule_command)
+        self.runtime = AuthoritativeRuntime(self.core.world, self.command_bus)
+        self.semantic_journal = SemanticEventJournal(self._authoritative_state())
 
     @property
     def world(self) -> World:
         return self.core.world
 
+    def _handle_core_command(self, command: CommandLike) -> Event:
+        return self.core.handle(cast(Command, command))
+
+    def _handle_rule_command(self, command: CommandLike) -> Event:
+        typed = cast(RuleExecuteCommand, command)
+        event, result = self._execute_rule_impl(typed)
+        self._rule_results[typed.command_id] = result
+        return event
+
     def handle(self, command: Command | RuleExecuteCommand) -> Event:
-        if isinstance(command, RuleExecuteCommand):
-            return self.execute_rule(command)[0]
-        return self.core.handle(command)
+        before = self._authoritative_state()
+        before_rule_state = deepcopy(self.rule_state)
+        try:
+            event = self.runtime.execute(cast(CommandLike, command))
+        except Exception:
+            self.rule_state = before_rule_state
+            raise
+        after = self._authoritative_state()
+        self.semantic_journal.append(
+            command_id=command.command_id,
+            event_kind=event.kind,
+            before=before,
+            after=after,
+            entity_id=event.entity_id,
+            data=deepcopy(event.payload),
+        )
+        return event
 
     def execute_rule(self, command: RuleExecuteCommand) -> tuple[Event, RuleExecutionResult]:
+        event = self.handle(command)
+        try:
+            result = self._rule_results.pop(command.command_id)
+        except KeyError as exc:
+            raise RuntimeError("rule command completed without an execution result") from exc
+        return event, result
+
+    def _execute_rule_impl(self, command: RuleExecuteCommand) -> tuple[Event, RuleExecutionResult]:
         compiled = self.compiler.compile(command.document)
         result = RuleInterpreter(self.rules).execute(compiled, state=deepcopy(command.state))
         self.rule_state[command.document.rule_id] = deepcopy(result.state)
@@ -75,9 +126,28 @@ class WorldPlatformEngine:
         )
         return event, result
 
-    def snapshot(self) -> dict[str, Any]:
+    def _authoritative_state(self) -> dict[str, object]:
         return {
             "world": self.core.world.model_dump(mode="json"),
             "rule_state": deepcopy(self.rule_state),
             "orchestrator": self.orchestrator.model_dump(mode="json"),
+            "scheduler": {
+                "tick": self.scheduler.tick,
+                "pending": [
+                    {
+                        "task_id": task.task_id,
+                        "due_tick": task.due_tick,
+                        "domain": task.domain.value,
+                        "kind": task.kind,
+                        "actor_id": task.actor_id,
+                        "payload": deepcopy(task.payload),
+                    }
+                    for task in self.scheduler.pending()
+                ],
+            },
         }
+
+    def snapshot(self) -> dict[str, Any]:
+        snapshot: dict[str, Any] = self._authoritative_state()
+        snapshot["journal_head_hash"] = self.semantic_journal.journal.head_hash
+        return snapshot

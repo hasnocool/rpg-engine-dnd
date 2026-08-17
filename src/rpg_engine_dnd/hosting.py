@@ -18,6 +18,13 @@ class AsyncPersistence(Protocol):
     async def put_json(self, namespace: str, key: str, value: dict[str, object]) -> None: ...
     async def get_json(self, namespace: str, key: str) -> dict[str, object] | None: ...
     async def list_json(self, namespace: str) -> dict[str, dict[str, object]]: ...
+    async def compare_and_set_json(
+        self,
+        namespace: str,
+        key: str,
+        expected: dict[str, object] | None,
+        value: dict[str, object],
+    ) -> bool: ...
 
 
 MIGRATIONS: tuple[str, ...] = (
@@ -81,6 +88,43 @@ class AsyncPostgresStore:
                 key,
                 payload,
             )
+
+    async def compare_and_set_json(
+        self,
+        namespace: str,
+        key: str,
+        expected: dict[str, object] | None,
+        value: dict[str, object],
+    ) -> bool:
+        pool = self._require_pool()
+        payload = canonical_json(value)
+        async with pool.acquire() as connection:
+            if expected is None:
+                row = await connection.fetchrow(
+                    """
+                    INSERT INTO platform_json(namespace, key, payload)
+                    VALUES($1, $2, $3::jsonb)
+                    ON CONFLICT(namespace, key) DO NOTHING
+                    RETURNING key
+                    """,
+                    namespace,
+                    key,
+                    payload,
+                )
+            else:
+                row = await connection.fetchrow(
+                    """
+                    UPDATE platform_json
+                    SET payload=$3::jsonb, updated_at=NOW()
+                    WHERE namespace=$1 AND key=$2 AND payload=$4::jsonb
+                    RETURNING key
+                    """,
+                    namespace,
+                    key,
+                    payload,
+                    canonical_json(expected),
+                )
+        return row is not None
 
     async def get_json(self, namespace: str, key: str) -> dict[str, object] | None:
         pool = self._require_pool()
