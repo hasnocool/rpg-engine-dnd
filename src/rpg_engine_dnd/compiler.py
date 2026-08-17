@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Literal
+from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from .canonical import canonical_hash
@@ -92,6 +92,32 @@ class RuleInterpreter:
         self.step_budget = step_budget
 
     @staticmethod
+    def _int_value(value: object, *, name: str) -> int:
+        if isinstance(value, bool):
+            raise TypeError(f"{name} must be an integer")
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError as exc:
+                raise TypeError(f"{name} must be an integer") from exc
+        raise TypeError(f"{name} must be an integer")
+
+    @classmethod
+    def _int_arg(cls, args: dict[str, object], key: str, default: int = 0) -> int:
+        return cls._int_value(args.get(key, default), name=key)
+
+    @staticmethod
+    def _object_arg(args: dict[str, object], key: str) -> dict[str, object]:
+        value = args.get(key, {})
+        if not isinstance(value, dict) or not all(isinstance(item, str) for item in value):
+            raise TypeError(f"{key} must be an object with string keys")
+        return deepcopy(cast(dict[str, object], value))
+
+    @staticmethod
     def _set_path(state: dict[str, object], path: str, value: object) -> None:
         parts = path.split(".")
         cursor: dict[str, object] = state
@@ -116,19 +142,20 @@ class RuleInterpreter:
             result: dict[str, object] = {}
             next_node = node.next_node
             if node.op == "roll":
-                outcome = self.runtime.roll(
+                roll_outcome = self.runtime.roll(
                     RollContext(
                         actor_id=str(args.get("actor_id", "system")),
                         purpose=str(args.get("purpose", compiled.document.rule_id)),
-                        bonus=int(args.get("bonus", 0)),
+                        bonus=self._int_arg(args, "bonus"),
                     )
                 )
-                result = {"total": outcome.total, "selected": outcome.selected}
+                result = {"total": roll_outcome.total, "selected": roll_outcome.selected}
                 threshold = args.get("threshold")
                 if threshold is not None:
-                    next_node = node.true_node if outcome.total >= int(threshold) else node.false_node
+                    threshold_value = self._int_value(threshold, name="threshold")
+                    next_node = node.true_node if roll_outcome.total >= threshold_value else node.false_node
             elif node.op == "damage":
-                outcome = self.runtime.damage(
+                damage_outcome = self.runtime.damage(
                     DamageContext(
                         source_id=str(args.get("source_id", "system")),
                         target_id=str(args["target_id"]),
@@ -136,11 +163,11 @@ class RuleInterpreter:
                         damage_type=str(args.get("damage_type", "untyped")),
                     )
                 )
-                result = {"amount": outcome.amount, "damage_type": outcome.damage_type}
+                result = {"amount": damage_outcome.amount, "damage_type": damage_outcome.damage_type}
             elif node.op == "heal":
-                result = {"amount": max(0, int(args.get("amount", 0)))}
+                result = {"amount": max(0, self._int_arg(args, "amount"))}
             elif node.op == "resource":
-                result = {"resource": str(args["resource"]), "delta": int(args.get("delta", 0))}
+                result = {"resource": str(args["resource"]), "delta": self._int_arg(args, "delta")}
             elif node.op in {"effect", "condition"}:
                 effects += 1
                 if effects > compiled.effect_budget:
@@ -150,7 +177,7 @@ class RuleInterpreter:
                     source_id=str(args.get("source_id", "system")),
                     target_id=str(args["target_id"]),
                     kind=str(args.get("kind", node.op)),
-                    payload=dict(args.get("payload", {})),
+                    payload=self._object_arg(args, "payload"),
                 )
                 generated = self.runtime.apply_effect(effect)
                 result = {"effects": [item.effect_id for item in generated]}

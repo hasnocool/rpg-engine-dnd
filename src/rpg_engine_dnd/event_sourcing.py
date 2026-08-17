@@ -74,16 +74,27 @@ class EventJournal:
         patch = make_patch(before, after)
         sequence = len(self.entries) + 1
         previous_hash = self.head_hash
-        material = {
+        before_hash = canonical_hash(before)
+        after_hash = canonical_hash(after)
+        material: dict[str, object] = {
             "sequence": sequence,
             "command_id": command_id,
             "event_kind": event_kind,
             "patch": patch,
             "previous_hash": previous_hash,
-            "before_hash": canonical_hash(before),
-            "after_hash": canonical_hash(after),
+            "before_hash": before_hash,
+            "after_hash": after_hash,
         }
-        entry = JournalEntry(**material, entry_hash=canonical_hash(material))
+        entry = JournalEntry(
+            sequence=sequence,
+            command_id=command_id,
+            event_kind=event_kind,
+            patch=patch,
+            previous_hash=previous_hash,
+            before_hash=before_hash,
+            after_hash=after_hash,
+            entry_hash=canonical_hash(material),
+        )
         self.entries.append(entry)
         self._command_ids[command_id] = sequence
         return entry
