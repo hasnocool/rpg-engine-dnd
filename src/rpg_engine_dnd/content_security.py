@@ -50,7 +50,7 @@ class TrustPolicy(BaseModel):
     denied_capabilities: frozenset[str] = frozenset({"arbitrary-code", "filesystem-write", "network-raw"})
     require_signature: bool = True
 
-    def validate(self, attestation: ContentAttestation) -> None:
+    def enforce(self, attestation: ContentAttestation) -> None:
         if self.trusted_publishers and attestation.publisher_id not in self.trusted_publishers:
             raise ValueError("publisher is not trusted")
         denied = self.denied_capabilities.intersection(attestation.capabilities.requested)
