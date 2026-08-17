@@ -5,14 +5,14 @@ from __future__ import annotations
 import heapq
 import math
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .dice import DiceStreams
 from .rules import AttackContext, DamageContext, RulesRuntime
-from .scheduler import ScheduleDomain, SimulationScheduler
-from .spatial import GridCell, GridSpace
+from .scheduler import ScheduleDomain, ScheduledTask, SimulationScheduler
+from .spatial import GridSpace
 from .spatial_query import SpatialQueryService
 
 
@@ -226,13 +226,14 @@ class CombatSystem:
             except ValueError:
                 continue
             space.cells[(blocker.x, blocker.y)] = cell.model_copy(update={"blocks_movement": True})
-        result = self.spatial_queries.path(
+        raw_path = self.spatial_queries.path(
             space,
             (start.x, start.y),
             (goal.x, goal.y),
             budget=budget,
         )
-        return [Position(x=coordinate[0], y=coordinate[1]) for coordinate in result]
+        coordinates = cast(list[tuple[int, int]], raw_path)
+        return [Position(x=coordinate[0], y=coordinate[1]) for coordinate in coordinates]
 
     def authoritative_line_of_sight(self, start: Position, goal: Position) -> bool:
         if self.grid_space is None:
@@ -316,8 +317,9 @@ class CombatSystem:
         if delay_ticks < 0:
             raise ValueError("delay_ticks must be non-negative")
         self._order += 1
+        base_tick = self.scheduler.tick if self.scheduler is not None else self.tick
         action = TimelineAction(
-            due_tick=self.tick + delay_ticks,
+            due_tick=base_tick + delay_ticks,
             order=self._order,
             actor_id=actor_id,
             kind=kind,
@@ -350,36 +352,51 @@ class CombatSystem:
                     updated.append(condition.model_copy(update={"rounds_remaining": remaining}))
             self.conditions[actor_id] = updated
 
+    def apply_scheduled(self, tasks: Iterable[ScheduledTask]) -> list[TimelineAction]:
+        """Consume only combat-tagged tasks after the platform advances the shared scheduler."""
+        if self.scheduler is None:
+            raise RuntimeError("combat is not attached to a shared scheduler")
+        delta = self.scheduler.tick - self.tick
+        if delta < 0:
+            raise RuntimeError("shared scheduler moved backwards")
+        for _ in range(delta):
+            self._advance_conditions_once()
+        self.tick = self.scheduler.tick
+        ready: list[TimelineAction] = []
+        for task in tasks:
+            order_raw = task.payload.get("combat_order")
+            if task.actor_id is None or not isinstance(order_raw, int) or not task.task_id.startswith("combat:"):
+                continue
+            payload = {key: value for key, value in task.payload.items() if key != "combat_order"}
+            ready.append(
+                TimelineAction(
+                    due_tick=task.due_tick,
+                    order=order_raw,
+                    actor_id=task.actor_id,
+                    kind=task.kind,
+                    payload=payload,
+                )
+            )
+        return sorted(ready)
+
     def advance(self, ticks: int = 1) -> list[TimelineAction]:
         if ticks < 0:
             raise ValueError("ticks must be non-negative")
+        if self.scheduler is not None:
+            raise RuntimeError("shared SimulationScheduler must be advanced by the platform authority")
         ready: list[TimelineAction] = []
         for _ in range(ticks):
             self.tick += 1
             self._advance_conditions_once()
-            if self.scheduler is None:
-                while self._queue and self._queue[0].due_tick <= self.tick:
-                    ready.append(heapq.heappop(self._queue))
-                continue
-            scheduled = self.scheduler.advance(1)
-            self.tick = self.scheduler.tick
-            for task in scheduled:
-                order_raw = task.payload.get("combat_order")
-                if task.actor_id is None or not isinstance(order_raw, int):
-                    continue
-                payload = {key: value for key, value in task.payload.items() if key != "combat_order"}
-                ready.append(
-                    TimelineAction(
-                        due_tick=task.due_tick,
-                        order=order_raw,
-                        actor_id=task.actor_id,
-                        kind=task.kind,
-                        payload=payload,
-                    )
-                )
+            while self._queue and self._queue[0].due_tick <= self.tick:
+                ready.append(heapq.heappop(self._queue))
         return ready
 
-    def distance(self, a: Position, b: Position) -> float:
+    @staticmethod
+    def distance(a: Position, b: Position) -> float:
+        return math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
+
+    def authoritative_distance(self, a: Position, b: Position) -> float:
         if self.grid_space is not None and a.z == 0 and b.z == 0:
             return self.spatial_queries.distance(self.grid_space, (a.x, a.y), (b.x, b.y))
-        return math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
+        return self.distance(a, b)
