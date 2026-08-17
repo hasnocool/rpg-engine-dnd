@@ -7,13 +7,14 @@ from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .canonical import canonical_hash
 from .commands import Command
 from .compiler import RuleCompiler, RuleDocument, RuleExecutionResult, RuleInterpreter
 from .engine import SimulationEngine
 from .events import Event
 from .knowledge import KnowledgeAuthority
 from .models import World
-from .orchestrator import CampaignOrchestrator
+from .orchestrator import CampaignOrchestrator, Scene, SceneStatus
 from .rules import RulesRuntime
 from .runtime import AuthoritativeRuntime, CommandBus, CommandLike
 from .scheduler import SimulationScheduler
@@ -53,6 +54,9 @@ class WorldPlatformEngine:
         self.scheduler = SimulationScheduler()
         self.rule_state: dict[str, object] = {}
         self._rule_results: dict[str, RuleExecutionResult] = {}
+        self._completed_events: dict[str, Event] = {}
+        self._command_hashes: dict[str, str] = {}
+        self._scene_command_sequence = 0
 
         self.command_bus = CommandBus()
         for kind in self._CORE_KINDS:
@@ -74,32 +78,58 @@ class WorldPlatformEngine:
         self._rule_results[typed.command_id] = result
         return event
 
+    @staticmethod
+    def _command_hash(command: Command | RuleExecuteCommand) -> str:
+        return canonical_hash(command.model_dump(mode="json"))
+
+    def _completed_event(self, command: Command | RuleExecuteCommand) -> Event | None:
+        existing = self._completed_events.get(command.command_id)
+        if existing is None:
+            return None
+        command_hash = self._command_hash(command)
+        if self._command_hashes[command.command_id] != command_hash:
+            raise ValueError("command_id was reused for a different command")
+        return existing.model_copy(deep=True)
+
     def handle(self, command: Command | RuleExecuteCommand) -> Event:
+        completed = self._completed_event(command)
+        if completed is not None:
+            return completed
+
         before = self._authoritative_state()
+        before_world = self.core.world.clone()
         before_rule_state = deepcopy(self.rule_state)
         try:
             event = self.runtime.execute(cast(CommandLike, command))
+            after = self._authoritative_state()
+            self.semantic_journal.append(
+                command_id=command.command_id,
+                event_kind=event.kind,
+                before=before,
+                after=after,
+                entity_id=event.entity_id,
+                data=deepcopy(event.payload),
+            )
         except Exception:
+            self.core.world.revision = before_world.revision
+            self.core.world.entities = {
+                entity_id: entity.clone() for entity_id, entity in before_world.entities.items()
+            }
             self.rule_state = before_rule_state
+            self._rule_results.pop(command.command_id, None)
             raise
-        after = self._authoritative_state()
-        self.semantic_journal.append(
-            command_id=command.command_id,
-            event_kind=event.kind,
-            before=before,
-            after=after,
-            entity_id=event.entity_id,
-            data=deepcopy(event.payload),
-        )
+
+        self._completed_events[command.command_id] = event.model_copy(deep=True)
+        self._command_hashes[command.command_id] = self._command_hash(command)
         return event
 
     def execute_rule(self, command: RuleExecuteCommand) -> tuple[Event, RuleExecutionResult]:
         event = self.handle(command)
         try:
-            result = self._rule_results.pop(command.command_id)
+            result = self._rule_results[command.command_id]
         except KeyError as exc:
             raise RuntimeError("rule command completed without an execution result") from exc
-        return event, result
+        return event, result.model_copy(deep=True)
 
     def _execute_rule_impl(self, command: RuleExecuteCommand) -> tuple[Event, RuleExecutionResult]:
         compiled = self.compiler.compile(command.document)
@@ -125,6 +155,46 @@ class WorldPlatformEngine:
             },
         )
         return event, result
+
+    def _next_scene_command_id(self, operation: str, scene_id: str) -> str:
+        self._scene_command_sequence += 1
+        return f"scene:{operation}:{scene_id}:{self._scene_command_sequence}"
+
+    def register_scene(self, scene: Scene) -> Scene:
+        before = self._authoritative_state()
+        previous = self.orchestrator.model_copy(deep=True)
+        try:
+            self.orchestrator.register(scene.model_copy(deep=True))
+            after = self._authoritative_state()
+            self.semantic_journal.append(
+                command_id=self._next_scene_command_id("register", scene.scene_id),
+                event_kind="scene.registered",
+                before=before,
+                after=after,
+                data={"scene_id": scene.scene_id},
+            )
+        except Exception:
+            self.orchestrator = previous
+            raise
+        return self.orchestrator.scenes[scene.scene_id].model_copy(deep=True)
+
+    def transition_scene(self, scene_id: str, status: SceneStatus) -> Scene:
+        before = self._authoritative_state()
+        previous = self.orchestrator.model_copy(deep=True)
+        try:
+            scene = self.orchestrator.transition(scene_id, status)
+            after = self._authoritative_state()
+            self.semantic_journal.append(
+                command_id=self._next_scene_command_id(f"transition:{status.value}", scene_id),
+                event_kind="scene.transitioned",
+                before=before,
+                after=after,
+                data={"scene_id": scene_id, "status": status.value},
+            )
+        except Exception:
+            self.orchestrator = previous
+            raise
+        return scene.model_copy(deep=True)
 
     def _authoritative_state(self) -> dict[str, object]:
         return {
