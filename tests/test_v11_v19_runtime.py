@@ -113,6 +113,12 @@ def test_v13_event_journal_replay_rewind_branch_hashes_and_idempotency() -> None
     patch = make_patch(initial, third)
     assert apply_patch(initial, patch) == third
 
+    with_null = {"entities": {"hero": {"hp": 7, "condition": None}}}
+    null_patch = make_patch(second, with_null)
+    assert apply_patch(second, null_patch) == with_null
+    delete_patch = make_patch(with_null, second)
+    assert apply_patch(with_null, delete_patch) == second
+
 
 def test_v14_spatial_graph_grid_continuous_authority() -> None:
     graph = GraphSpace(capacities={"a": 1, "b": 2})
