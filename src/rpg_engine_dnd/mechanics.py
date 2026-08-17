@@ -55,8 +55,7 @@ class ModifierResolver:
                 continue
             current = grouped.get(modifier.stacking_group)
             candidate_key = (modifier.priority, modifier.modifier_id)
-            current_key = (current.priority, current.modifier_id) if current else None
-            if current is None or candidate_key > current_key:
+            if current is None or candidate_key > (current.priority, current.modifier_id):
                 grouped[modifier.stacking_group] = modifier
         selected.extend(grouped.values())
         selected.sort(key=lambda item: (item.priority, item.modifier_id))
