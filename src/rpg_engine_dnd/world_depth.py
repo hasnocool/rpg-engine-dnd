@@ -69,10 +69,15 @@ class SettlementMarket(BaseModel):
     scarcity_sensitivity: float = Field(default=0.5, ge=0)
 
     def simulate_day(self) -> None:
-        for rule in self.production:
-            self.inventory[rule.item_id] = self.inventory.get(rule.item_id, 0.0) + rule.amount_per_day
-        for rule in self.consumption:
-            self.inventory[rule.item_id] = max(0.0, self.inventory.get(rule.item_id, 0.0) - rule.amount_per_day)
+        for production_rule in self.production:
+            self.inventory[production_rule.item_id] = (
+                self.inventory.get(production_rule.item_id, 0.0) + production_rule.amount_per_day
+            )
+        for consumption_rule in self.consumption:
+            self.inventory[consumption_rule.item_id] = max(
+                0.0,
+                self.inventory.get(consumption_rule.item_id, 0.0) - consumption_rule.amount_per_day,
+            )
 
     def price(self, item_id: str, *, target_stock: float = 100.0) -> float:
         base = self.base_prices[item_id]
