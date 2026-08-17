@@ -152,24 +152,92 @@ class DurableShardCoordinator:
             raise ValueError("stale shard fencing token")
         return lease
 
+    @staticmethod
+    def _assert_claim_matches(
+        claim: dict[str, object],
+        message: DurableMessage,
+        payload: dict[str, object],
+    ) -> None:
+        if claim.get("message_id") != message.message_id or claim.get("message") != payload:
+            raise ValueError("idempotency key was reused for a different durable message")
+
     async def publish(self, message: DurableMessage) -> bool:
+        """Persist a message exactly once while allowing interrupted publishes to recover.
+
+        The idempotency record is a small two-phase claim. A retry that finds a pending
+        claim for the same message completes the durable write instead of treating the
+        key as permanently consumed. With CAS, only the caller that transitions the
+        claim to ``complete`` reports a successful new publication.
+        """
         get_json = getattr(self.store, "get_json")
         put_json = getattr(self.store, "put_json")
         compare_and_set = getattr(self.store, "compare_and_set_json", None)
         key = message.idempotency_key
-        claim = {"message_id": message.message_id, "message": message.model_dump(mode="json")}
+        payload = message.model_dump(mode="json")
+        pending: dict[str, object] = {
+            "status": "pending",
+            "message_id": message.message_id,
+            "message": payload,
+        }
+        complete: dict[str, object] = {
+            "status": "complete",
+            "message_id": message.message_id,
+            "message": payload,
+        }
+        namespace = "world:message-idempotency"
+
         if compare_and_set is not None:
-            if not await compare_and_set("world:message-idempotency", key, None, claim):
+            existing = await get_json(namespace, key)
+            if existing is None:
+                if await compare_and_set(namespace, key, None, pending):
+                    existing = pending
+                else:
+                    existing = await get_json(namespace, key)
+            if existing is None:
+                raise RuntimeError("idempotency claim disappeared during publication")
+            self._assert_claim_matches(existing, message, payload)
+
+            status = existing.get("status")
+            if status == "complete":
                 return False
-            await put_json("world:message", message.message_id, message.model_dump(mode="json"))
-            return True
+            if status is None:
+                durable = await get_json("world:message", message.message_id)
+                if durable is not None:
+                    await compare_and_set(namespace, key, existing, complete)
+                    return False
+            elif status != "pending":
+                raise ValueError(f"unknown durable-message claim status: {status!r}")
+
+            await put_json("world:message", message.message_id, payload)
+            if await compare_and_set(namespace, key, existing, complete):
+                return True
+            final = await get_json(namespace, key)
+            if final is None:
+                raise RuntimeError("idempotency claim disappeared after durable write")
+            self._assert_claim_matches(final, message, payload)
+            if final.get("status") != "complete":
+                raise RuntimeError("durable-message claim could not be finalized")
+            return False
 
         async with self._lock:
-            existing = await get_json("world:message-idempotency", key)
+            existing = await get_json(namespace, key)
             if existing is not None:
-                return False
-            await put_json("world:message-idempotency", key, claim)
-            await put_json("world:message", message.message_id, message.model_dump(mode="json"))
+                self._assert_claim_matches(existing, message, payload)
+                status = existing.get("status")
+                if status == "complete":
+                    return False
+                if status is None:
+                    durable = await get_json("world:message", message.message_id)
+                    if durable is not None:
+                        await put_json(namespace, key, complete)
+                        return False
+                elif status != "pending":
+                    raise ValueError(f"unknown durable-message claim status: {status!r}")
+            else:
+                await put_json(namespace, key, pending)
+
+            await put_json("world:message", message.message_id, payload)
+            await put_json(namespace, key, complete)
             return True
 
     async def dead_letter(self, message: DurableMessage, reason: str) -> None:
