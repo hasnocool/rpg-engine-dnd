@@ -5,13 +5,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rpg_engine_dnd.browser import BROWSER_HTML
+from rpg_engine_dnd.browser import BROWSER_HTML, ORIGINAL_BROWSER_HTML
 from rpg_engine_dnd.studio import (
     StudioEditors,
     StudioItemEnvelope,
     StudioItemKind,
     StudioProject,
 )
+from rpg_engine_dnd.studio_browser import BROWSER_HTML as STUDIO_BROWSER_HTML
 
 
 def test_studio_item_export_import_round_trip() -> None:
@@ -97,7 +98,37 @@ def test_example_shattered_beacon_project_validates_all_items() -> None:
     }
 
 
-def test_browser_preserves_existing_creator_studio_controls() -> None:
+def test_original_browser_is_restored_as_browser_navigation_view() -> None:
+    for control_id in (
+        "campaign",
+        "owner",
+        "create",
+        "refresh",
+        "entity",
+        "name",
+        "addEntity",
+        "project",
+        "saveProject",
+        "snapshotProject",
+        "map",
+        "studio",
+        "world",
+    ):
+        assert f'id="{control_id}"' in ORIGINAL_BROWSER_HTML
+
+    assert "Save map project" in ORIGINAL_BROWSER_HTML
+    assert "Click empty space to add nodes" in ORIGINAL_BROWSER_HTML
+    assert 'id="libraryProject"' not in ORIGINAL_BROWSER_HTML
+    assert 'id="mapItem"' not in ORIGINAL_BROWSER_HTML
+
+    assert 'id="navBrowser"' in BROWSER_HTML
+    assert 'id="navStudio"' in BROWSER_HTML
+    assert 'title="Original RPG browser"' in BROWSER_HTML
+    assert 'title="Creator Studio"' in BROWSER_HTML
+    assert "#creator-studio" in BROWSER_HTML
+
+
+def test_creator_studio_remains_intact_as_separate_navigation_view() -> None:
     for control_id in (
         "campaign",
         "owner",
@@ -117,31 +148,26 @@ def test_browser_preserves_existing_creator_studio_controls() -> None:
         "studio",
         "world",
     ):
-        assert f'id="{control_id}"' in BROWSER_HTML
-    assert "authoritative deterministic runtime + Creator Studio" in BROWSER_HTML
-    assert "Click empty space to add nodes" in BROWSER_HTML
+        assert f'id="{control_id}"' in STUDIO_BROWSER_HTML
 
+    assert 'id="libraryProject"' in STUDIO_BROWSER_HTML
+    assert 'id="loadLibrary"' in STUDIO_BROWSER_HTML
+    assert 'id="libraryItem"' in STUDIO_BROWSER_HTML
+    assert 'id="loadItem"' in STUDIO_BROWSER_HTML
+    assert 'id="itemEditor"' in STUDIO_BROWSER_HTML
+    assert 'id="exportItem"' in STUDIO_BROWSER_HTML
+    assert "The Shattered Beacon" in STUDIO_BROWSER_HTML
+    assert "BUNDLED_PROJECTS" in STUDIO_BROWSER_HTML
+    assert "Studio item hash verification failed" in STUDIO_BROWSER_HTML
 
-def test_browser_integrates_selectable_library_without_replacing_studio() -> None:
-    assert 'id="libraryProject"' in BROWSER_HTML
-    assert 'id="loadLibrary"' in BROWSER_HTML
-    assert 'id="libraryItem"' in BROWSER_HTML
-    assert 'id="loadItem"' in BROWSER_HTML
-    assert 'id="itemEditor"' in BROWSER_HTML
-    assert 'id="exportItem"' in BROWSER_HTML
-    assert "The Shattered Beacon" in BROWSER_HTML
-    assert "BUNDLED_PROJECTS" in BROWSER_HTML
-    assert "Load bundled or imported content into this existing Studio project" in BROWSER_HTML
-    assert "Studio item hash verification failed" in BROWSER_HTML
-
-    project_controls = BROWSER_HTML.index('id="snapshotProject"')
-    content_library = BROWSER_HTML.index('<h3>Content library</h3>')
-    portable_import = BROWSER_HTML.index('id="importFile"')
+    project_controls = STUDIO_BROWSER_HTML.index('id="snapshotProject"')
+    content_library = STUDIO_BROWSER_HTML.index('<h3>Content library</h3>')
+    portable_import = STUDIO_BROWSER_HTML.index('id="importFile"')
     assert project_controls < content_library < portable_import
 
 
 def test_loading_bundled_content_does_not_persist_or_destroy_revisions() -> None:
-    load_function = BROWSER_HTML.split("async function loadBundledProject(key)", 1)[1].split(
+    load_function = STUDIO_BROWSER_HTML.split("async function loadBundledProject(key)", 1)[1].split(
         "$('loadLibrary').onclick", 1
     )[0]
 
