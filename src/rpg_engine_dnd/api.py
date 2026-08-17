@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .browser import BROWSER_HTML
-from .commands import CreateEntity, DeleteEntity, PatchComponent, RemoveComponent, SetComponent
+from .commands import Command, CreateEntity, DeleteEntity, PatchComponent, RemoveComponent, SetComponent
 from .canonical import canonical_hash
 from .compiler import RuleCompiler, RuleDocument
 from .director import AdvancedAIDirector, DirectorObservation
@@ -105,17 +105,20 @@ class CampaignRuntime:
             queue.put_nowait(event)
 
     async def command(self, raw: dict[str, Any]) -> Event:
-        command_types = {
-            "entity.create": CreateEntity,
-            "entity.delete": DeleteEntity,
-            "component.set": SetComponent,
-            "component.patch": PatchComponent,
-            "component.remove": RemoveComponent,
-        }
-        model = command_types.get(str(raw.get("kind")))
-        if model is None:
+        kind = str(raw.get("kind"))
+        command: Command
+        if kind == "entity.create":
+            command = CreateEntity.model_validate(raw)
+        elif kind == "entity.delete":
+            command = DeleteEntity.model_validate(raw)
+        elif kind == "component.set":
+            command = SetComponent.model_validate(raw)
+        elif kind == "component.patch":
+            command = PatchComponent.model_validate(raw)
+        elif kind == "component.remove":
+            command = RemoveComponent.model_validate(raw)
+        else:
             raise ValueError(f"unsupported command kind: {raw.get('kind')}")
-        command = model.model_validate(raw)
         async with self.lock:
             event = self.platform.handle(command)
             subscribers = self._record_locked(event)
