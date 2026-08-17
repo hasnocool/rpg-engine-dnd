@@ -67,11 +67,32 @@ class TransferLease(BaseModel):
 
 
 class DurableShardCoordinator:
-    """Store-backed coordinator using the repository's async JSON persistence contract."""
+    """Store-backed coordinator with process-safe CAS when the store supports it."""
 
     def __init__(self, store: object) -> None:
         self.store = store
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _next_lease(
+        previous_raw: dict[str, object] | None,
+        *,
+        shard_id: str,
+        region: str,
+        owner_id: str,
+        lease_id: str,
+        ttl_seconds: int,
+    ) -> ShardLease:
+        previous = ShardLease.model_validate(previous_raw) if previous_raw else None
+        return ShardLease(
+            shard_id=shard_id,
+            region=region,
+            epoch=1 if previous is None else previous.epoch + 1,
+            lease_id=lease_id,
+            fencing_token=1 if previous is None else previous.fencing_token + 1,
+            owner_id=owner_id,
+            expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
+        )
 
     async def acquire_lease(
         self,
@@ -85,20 +106,37 @@ class DurableShardCoordinator:
         if ttl_seconds < 1:
             raise ValueError("ttl_seconds must be positive")
         get_json = getattr(self.store, "get_json")
+        compare_and_set = getattr(self.store, "compare_and_set_json", None)
+        if compare_and_set is not None:
+            for _ in range(16):
+                previous_raw = await get_json("world:lease", shard_id)
+                lease = self._next_lease(
+                    previous_raw,
+                    shard_id=shard_id,
+                    region=region,
+                    owner_id=owner_id,
+                    lease_id=lease_id,
+                    ttl_seconds=ttl_seconds,
+                )
+                if await compare_and_set(
+                    "world:lease",
+                    shard_id,
+                    previous_raw,
+                    lease.model_dump(mode="json"),
+                ):
+                    return lease
+            raise RuntimeError("shard lease contention exceeded retry budget")
+
         put_json = getattr(self.store, "put_json")
         async with self._lock:
             previous_raw = await get_json("world:lease", shard_id)
-            previous = ShardLease.model_validate(previous_raw) if previous_raw else None
-            epoch = 1 if previous is None else previous.epoch + 1
-            token = 1 if previous is None else previous.fencing_token + 1
-            lease = ShardLease(
+            lease = self._next_lease(
+                previous_raw,
                 shard_id=shard_id,
                 region=region,
-                epoch=epoch,
-                lease_id=lease_id,
-                fencing_token=token,
                 owner_id=owner_id,
-                expires_at=datetime.now(UTC) + timedelta(seconds=ttl_seconds),
+                lease_id=lease_id,
+                ttl_seconds=ttl_seconds,
             )
             await put_json("world:lease", shard_id, lease.model_dump(mode="json"))
             return lease
@@ -117,13 +155,21 @@ class DurableShardCoordinator:
     async def publish(self, message: DurableMessage) -> bool:
         get_json = getattr(self.store, "get_json")
         put_json = getattr(self.store, "put_json")
+        compare_and_set = getattr(self.store, "compare_and_set_json", None)
         key = message.idempotency_key
+        claim = {"message_id": message.message_id, "message": message.model_dump(mode="json")}
+        if compare_and_set is not None:
+            if not await compare_and_set("world:message-idempotency", key, None, claim):
+                return False
+            await put_json("world:message", message.message_id, message.model_dump(mode="json"))
+            return True
+
         async with self._lock:
             existing = await get_json("world:message-idempotency", key)
             if existing is not None:
                 return False
+            await put_json("world:message-idempotency", key, claim)
             await put_json("world:message", message.message_id, message.model_dump(mode="json"))
-            await put_json("world:message-idempotency", key, {"message_id": message.message_id})
             return True
 
     async def dead_letter(self, message: DurableMessage, reason: str) -> None:
