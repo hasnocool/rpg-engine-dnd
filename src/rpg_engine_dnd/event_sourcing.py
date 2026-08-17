@@ -12,37 +12,53 @@ JSONValue = object
 
 
 def make_patch(before: object, after: object) -> object:
-    """Create a deterministic JSON merge-style patch."""
+    """Create a deterministic, JSON-safe structural patch.
+
+    Patch operations are explicitly tagged so a state value of ``None`` is distinct
+    from deleting a key. Replacement values are always wrapped, which also prevents
+    user state that happens to contain ``$op`` from colliding with patch metadata.
+    """
     if before == after:
         return {}
     if isinstance(before, dict) and isinstance(after, dict):
-        patch: dict[str, object] = {}
+        changes: dict[str, object] = {}
         for key in sorted(set(before) | set(after)):
             if key not in after:
-                patch[key] = None
+                changes[key] = {"$op": "delete"}
             elif key not in before:
-                patch[key] = deepcopy(after[key])
+                changes[key] = {"$op": "replace", "value": deepcopy(after[key])}
             else:
                 nested = make_patch(before[key], after[key])
                 if nested != {}:
-                    patch[key] = nested
-        return patch
-    return deepcopy(after)
+                    changes[key] = nested
+        return {"$op": "object", "changes": changes} if changes else {}
+    return {"$op": "replace", "value": deepcopy(after)}
 
 
 def apply_patch(state: object, patch: object) -> object:
+    if patch == {}:
+        return deepcopy(state)
     if not isinstance(patch, dict):
-        return deepcopy(patch)
-    if not isinstance(state, dict):
-        state = {}
-    result = deepcopy(state)
-    assert isinstance(result, dict)
-    for key in sorted(patch):
-        value = patch[key]
-        if value is None:
+        raise ValueError("invalid structural patch")
+
+    operation = patch.get("$op")
+    if operation == "replace":
+        return deepcopy(patch.get("value"))
+    if operation == "delete":
+        raise ValueError("delete patch is only valid inside an object patch")
+    if operation != "object":
+        raise ValueError(f"unknown structural patch operation: {operation!r}")
+
+    changes = patch.get("changes")
+    if not isinstance(changes, dict):
+        raise ValueError("object patch changes must be an object")
+    result = deepcopy(state) if isinstance(state, dict) else {}
+    for key in sorted(changes):
+        nested = changes[key]
+        if isinstance(nested, dict) and nested.get("$op") == "delete":
             result.pop(key, None)
         else:
-            result[key] = apply_patch(result.get(key), value)
+            result[key] = apply_patch(result.get(key), nested)
     return result
 
 
