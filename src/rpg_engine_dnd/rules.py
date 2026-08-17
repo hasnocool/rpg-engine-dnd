@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pydantic import BaseModel, ConfigDict, Field
 
 from .dice import DiceStreams
+from .mechanics import Modifier, ModifierResolution, ModifierResolver, ReactionChoice, ReactionStack, ReactionWindow
 from .srd import AdvantageState, resolve_d20
 
 
@@ -118,9 +119,22 @@ class RulesRuntime:
         self._hooks: dict[str, list[TriggerHook]] = defaultdict(list)
         self.reactions: list[ReactionOpportunity] = []
         self.action_economy: dict[str, ActionEconomy] = {}
+        self.modifier_resolver = ModifierResolver()
+        self.modifiers: dict[str, list[Modifier]] = defaultdict(list)
+        self.reaction_stack = ReactionStack()
 
     def register_hook(self, trigger: str, hook: TriggerHook) -> None:
         self._hooks[trigger].append(hook)
+
+    def add_modifier(self, target: str, modifier: Modifier) -> None:
+        self.modifiers[target].append(modifier)
+        self.modifiers[target].sort(key=lambda item: (item.priority, item.modifier_id))
+
+    def resolve_modifier_value(self, target: str, base: float, *, scope: str | None = None) -> ModifierResolution:
+        candidates = self.modifiers.get(target, [])
+        if scope is not None:
+            candidates = [item for item in candidates if item.scope in {scope, "*"}]
+        return self.modifier_resolver.resolve(base, list(candidates))
 
     def roll(self, context: RollContext) -> RollOutcome:
         selected, raw = resolve_d20(
@@ -129,7 +143,15 @@ class RulesRuntime:
             stream=f"rules:roll:{context.actor_id}:{context.purpose}",
         )
         traces = (*context.modifiers, ModifierTrace(source="context", value=context.bonus, reason=context.purpose))
-        total = selected + sum(trace.value for trace in traces)
+        base_bonus = sum(trace.value for trace in traces)
+        resolved = self.resolve_modifier_value(context.actor_id, float(base_bonus), scope=context.purpose)
+        total = selected + int(resolved.value)
+        if resolved.applied_ids:
+            traces = (*traces, ModifierTrace(
+                source="modifier-resolver",
+                value=int(resolved.value) - base_bonus,
+                reason=",".join(resolved.applied_ids),
+            ))
         return RollOutcome(raw_rolls=raw, selected=selected, total=total, traces=traces)
 
     def attack(self, context: AttackContext) -> AttackOutcome:
@@ -148,7 +170,8 @@ class RulesRuntime:
             context.expression,
             stream=f"rules:damage:{context.source_id}:{context.target_id}",
         ).total
-        return DamageOutcome(amount=max(0, amount), damage_type=context.damage_type)
+        resolved = self.resolve_modifier_value(context.target_id, float(amount), scope=f"damage:{context.damage_type}")
+        return DamageOutcome(amount=max(0, int(resolved.value)), damage_type=context.damage_type)
 
     def apply_effect(self, effect: Effect) -> list[Effect]:
         generated: list[Effect] = [effect]
@@ -158,6 +181,18 @@ class RulesRuntime:
 
     def offer_reaction(self, opportunity: ReactionOpportunity) -> None:
         self.reactions.append(opportunity)
+
+    def open_reaction_window(self, window: ReactionWindow) -> None:
+        self.reaction_stack.open(window)
+
+    def offer_reaction_choice(self, choice: ReactionChoice) -> None:
+        current = self.reaction_stack.current
+        if current is None:
+            raise ValueError("no active reaction window")
+        current.offer(choice)
+
+    def resolve_reactions(self) -> tuple[ReactionChoice, ...]:
+        return self.reaction_stack.resolve_current()
 
     def reset_turn(self, actor_id: str, *, movement: int) -> ActionEconomy:
         economy = ActionEconomy(movement=movement)
