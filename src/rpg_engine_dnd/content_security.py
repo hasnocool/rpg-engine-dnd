@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from .canonical import canonical_hash
@@ -50,12 +52,22 @@ class TrustPolicy(BaseModel):
     denied_capabilities: frozenset[str] = frozenset({"arbitrary-code", "filesystem-write", "network-raw"})
     require_signature: bool = True
 
-    def enforce(self, attestation: ContentAttestation) -> None:
+    def enforce(
+        self,
+        attestation: ContentAttestation,
+        *,
+        identity: PublisherIdentity | None = None,
+    ) -> None:
         if self.trusted_publishers and attestation.publisher_id not in self.trusted_publishers:
             raise ValueError("publisher is not trusted")
         denied = self.denied_capabilities.intersection(attestation.capabilities.requested)
         if denied:
             raise ValueError(f"package requests denied capabilities: {sorted(denied)}")
+        if self.require_signature:
+            if identity is None:
+                raise ValueError("publisher identity is required for signature verification")
+            if not Ed25519Verifier.verify(identity, attestation):
+                raise ValueError("content signature verification failed")
 
 
 class Ed25519Verifier:
@@ -70,9 +82,11 @@ class Ed25519Verifier:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         except ImportError as exc:  # pragma: no cover - packaging environment guard
             raise RuntimeError("cryptography is required for Ed25519 verification") from exc
-        key = Ed25519PublicKey.from_public_bytes(base64.b64decode(identity.public_key_b64))
         try:
-            key.verify(base64.b64decode(attestation.signature_b64), attestation.signed_material())
-        except (InvalidSignature, ValueError):
+            key_bytes = base64.b64decode(identity.public_key_b64, validate=True)
+            signature = base64.b64decode(attestation.signature_b64, validate=True)
+            key = Ed25519PublicKey.from_public_bytes(key_bytes)
+            key.verify(signature, attestation.signed_material())
+        except (InvalidSignature, ValueError, binascii.Error):
             return False
         return True
