@@ -102,7 +102,17 @@ class CampaignRuntime:
     @staticmethod
     def _publish(event: Event, subscribers: list[asyncio.Queue[Event]]) -> None:
         for queue in subscribers:
-            queue.put_nowait(event)
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                # A slow client must never make an already-committed authoritative
+                # mutation look like it failed. Keep the newest event; clients can
+                # recover older sequences from the event-history endpoint.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    continue
+                queue.put_nowait(event)
 
     async def command(self, raw: dict[str, Any]) -> Event:
         kind = str(raw.get("kind"))
