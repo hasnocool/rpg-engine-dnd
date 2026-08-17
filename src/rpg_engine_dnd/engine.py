@@ -76,7 +76,7 @@ class SimulationEngine:
 
     def _delete(self, command: DeleteEntity) -> Event:
         entity = self.world.entity(command.entity_id)
-        payload = {"components": deepcopy(entity.components)}
+        payload: dict[str, object] = {"components": deepcopy(entity.components)}
         del self.world.entities[command.entity_id]
         return self._next_event(
             command,

@@ -48,7 +48,7 @@ class AsyncPostgresStore:
         self._pool: Any = None
 
     async def initialize(self) -> None:
-        import asyncpg
+        import asyncpg  # type: ignore[import-untyped]
 
         self._pool = await asyncpg.create_pool(self.dsn)
         async with self._pool.acquire() as connection:

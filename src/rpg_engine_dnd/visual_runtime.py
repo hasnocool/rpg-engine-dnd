@@ -31,7 +31,7 @@ class VisualSnapshot(BaseModel):
 
     @classmethod
     def from_knowledge(cls, view: KnowledgeView, bindings: dict[str, SceneAssetBinding] | None = None) -> "VisualSnapshot":
-        entities = {
+        entities: dict[str, dict[str, object]] = {
             entity_id: {"entity_id": entity_id, "components": deepcopy(components)}
             for entity_id, components in sorted(view.entities.items())
         }

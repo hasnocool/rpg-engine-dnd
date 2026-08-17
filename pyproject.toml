@@ -49,6 +49,7 @@ ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"
+plugins = ["pydantic.mypy"]
 packages = ["rpg_engine_dnd"]
 mypy_path = ["src"]
 disallow_untyped_defs = true
