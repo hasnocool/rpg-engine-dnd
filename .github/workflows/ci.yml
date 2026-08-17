@@ -27,4 +27,13 @@ jobs:
           status=${PIPESTATUS[0]}
           python .github/scripts/mypy_annotations.py /tmp/mypy-output.txt
           exit "$status"
-      - run: pytest
+      - name: Test
+        shell: bash
+        run: |
+          set +e
+          pytest -vv --tb=short 2>&1 | tee /tmp/pytest-output.txt
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            python .github/scripts/pytest_annotations.py /tmp/pytest-output.txt
+          fi
+          exit "$status"
