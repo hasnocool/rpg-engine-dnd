@@ -1,7 +1,10 @@
 # tests/test_api_v3.py
+import asyncio
+
+import pytest
 from fastapi.testclient import TestClient
 
-from rpg_engine_dnd.api import create_app
+from rpg_engine_dnd.api import CampaignRuntime, create_app
 
 
 OWNER = {"x-owner-id": "gm"}
@@ -169,3 +172,25 @@ def test_authoritative_rule_scene_studio_and_distribution_api() -> None:
         lock = client.get("/v3/distribution/resolve/starter.adventure")
         assert lock.status_code == 200
         assert lock.json()["releases"][0][0] == "starter.adventure"
+
+
+@pytest.mark.asyncio
+async def test_slow_event_subscriber_does_not_fail_authoritative_command() -> None:
+    runtime = CampaignRuntime("c1", "seed", "gm")
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+    await queue.put("stale")
+    runtime.subscribers.add(queue)
+
+    event = await runtime.command(
+        {
+            "kind": "entity.create",
+            "command_id": "create:hero",
+            "entity_id": "hero",
+            "components": {"identity": {"name": "Aster"}},
+        }
+    )
+
+    assert event.kind == "entity.created"
+    assert runtime.engine.world.entity("hero").components["identity"]["name"] == "Aster"
+    delivered = queue.get_nowait()
+    assert delivered == event
