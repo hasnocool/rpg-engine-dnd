@@ -70,12 +70,13 @@ class CampaignSession:
         for queue in queues:
             queue.put_nowait(event)
 
-    async def next_event(self, user_id: str, *, timeout: float | None = None) -> Event:
+    async def next_event(self, user_id: str, *, wait_seconds: float | None = None) -> Event:
         async with self._lock:
             queue = self._subscribers[user_id]
-        if timeout is None:
+        if wait_seconds is None:
             return await queue.get()
-        return await asyncio.wait_for(queue.get(), timeout=timeout)
+        async with asyncio.timeout(wait_seconds):
+            return await queue.get()
 
 
 class CampaignHost:
