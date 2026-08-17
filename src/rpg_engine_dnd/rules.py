@@ -136,15 +136,28 @@ class RulesRuntime:
             candidates = [item for item in candidates if item.scope in {scope, "*"}]
         return self.modifier_resolver.resolve(base, list(candidates))
 
+    @staticmethod
+    def _combine_advantage(base: AdvantageState, modifier: int) -> AdvantageState:
+        if modifier > 0:
+            if base == AdvantageState.DISADVANTAGE:
+                return AdvantageState.NORMAL
+            return AdvantageState.ADVANTAGE
+        if modifier < 0:
+            if base == AdvantageState.ADVANTAGE:
+                return AdvantageState.NORMAL
+            return AdvantageState.DISADVANTAGE
+        return base
+
     def roll(self, context: RollContext) -> RollOutcome:
-        selected, raw = resolve_d20(
-            self.dice,
-            state=context.advantage,
-            stream=f"rules:roll:{context.actor_id}:{context.purpose}",
-        )
         traces = (*context.modifiers, ModifierTrace(source="context", value=context.bonus, reason=context.purpose))
         base_bonus = sum(trace.value for trace in traces)
         resolved = self.resolve_modifier_value(context.actor_id, float(base_bonus), scope=context.purpose)
+        roll_state = self._combine_advantage(context.advantage, resolved.advantage)
+        selected, raw = resolve_d20(
+            self.dice,
+            state=roll_state,
+            stream=f"rules:roll:{context.actor_id}:{context.purpose}",
+        )
         total = selected + int(resolved.value)
         if resolved.applied_ids:
             traces = (*traces, ModifierTrace(
