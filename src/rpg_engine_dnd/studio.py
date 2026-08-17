@@ -159,6 +159,7 @@ class StudioEditors:
         return document
 
     def _normalize(self, kind: StudioItemKind, raw: dict[str, object]) -> dict[str, object]:
+        model: BaseModel
         if kind == StudioItemKind.MAP:
             model = self.map_document(raw)
         elif kind == StudioItemKind.CREATURE:
