@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 from math import dist
+from typing import cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from .spatial import ContinuousSpace, GraphSpace, GridSpace
@@ -67,21 +68,23 @@ class SpatialQueryService:
     def path(self, space: GraphSpace | GridSpace | HexGridSpace, start: object, goal: object, *, budget: float | None = None) -> list[object]:
         if isinstance(space, GraphSpace):
             return list(space.route(str(start), str(goal)))
+        coordinates = cast(tuple[int, int], start)
+        destination = cast(tuple[int, int], goal)
         if isinstance(space, GridSpace):
-            return list(space.path(start, goal, budget=budget))  # type: ignore[arg-type]
-        return list(space.path(start, goal, budget=budget))  # type: ignore[arg-type]
+            return list(space.path(coordinates, destination, budget=budget))
+        return list(space.path(coordinates, destination, budget=budget))
 
     def distance(self, space: GraphSpace | GridSpace | HexGridSpace | ContinuousSpace, start: object, goal: object) -> float:
         if isinstance(space, GraphSpace):
             route = space.route(str(start), str(goal))
             return sum(space.edges[a][b] for a, b in zip(route, route[1:]))
         if isinstance(space, HexGridSpace):
-            return float(space.distance(start, goal))  # type: ignore[arg-type]
+            return float(space.distance(cast(tuple[int, int], start), cast(tuple[int, int], goal)))
         if isinstance(space, GridSpace):
-            a = start  # type: ignore[assignment]
-            b = goal  # type: ignore[assignment]
+            a = cast(tuple[int, int], start)
+            b = cast(tuple[int, int], goal)
             return float(abs(a[0] - b[0]) + abs(a[1] - b[1]))
-        return dist(start, goal)  # type: ignore[arg-type]
+        return dist(cast(tuple[float, ...], start), cast(tuple[float, ...], goal))
 
     def visible(self, space: GridSpace, start: tuple[int, int], goal: tuple[int, int]) -> bool:
         return space.line_of_sight(start, goal)
@@ -92,5 +95,5 @@ class SpatialQueryService:
     def occupants(self, space: GraphSpace | GridSpace | HexGridSpace, location: object) -> tuple[str, ...]:
         if isinstance(space, GraphSpace):
             return tuple(sorted(space.occupancy.get(str(location), set())))
-        occupant = space.occupancy.get(location)  # type: ignore[arg-type]
+        occupant = space.occupancy.get(cast(tuple[int, int], location))
         return () if occupant is None else (occupant,)
