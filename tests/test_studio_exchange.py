@@ -138,3 +138,12 @@ def test_browser_integrates_selectable_library_without_replacing_studio() -> Non
     content_library = BROWSER_HTML.index('<h3>Content library</h3>')
     portable_import = BROWSER_HTML.index('id="importFile"')
     assert project_controls < content_library < portable_import
+
+
+def test_loading_bundled_content_does_not_persist_or_destroy_revisions() -> None:
+    load_function = BROWSER_HTML.split("async function loadBundledProject(key)", 1)[1].split(
+        "$('loadLibrary').onclick", 1
+    )[0]
+
+    assert "/v3/studio/projects" not in load_function
+    assert "Use Save Studio project to persist changes" in load_function
