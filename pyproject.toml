@@ -1,27 +1,35 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.31,<2"]
 build-backend = "hatchling.build"
 
 [project]
 name = "rpg-engine-dnd"
-version = "0.1.0"
-description = "Headless deterministic tabletop RPG simulation engine"
+version = "3.0.0"
+description = "Headless deterministic tabletop RPG simulation and persistent-world platform"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "rpg-engine-dnd contributors" }]
 dependencies = [
-  "aiosqlite>=0.20,<1",
-  "pydantic>=2.11,<3",
+  "aiosqlite>=0.22.1,<1",
+  "asyncpg>=0.31,<1",
+  "fastapi>=0.139.2,<1",
+  "pydantic>=2.13.4,<3",
+  "textual>=8.2.8,<9",
+  "uvicorn[standard]>=0.51,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.4,<9",
-  "pytest-asyncio>=1.1,<2",
-  "ruff>=0.12,<1",
-  "mypy>=1.17,<2",
+  "mypy>=2.3,<3",
+  "pytest>=9.1.1,<10",
+  "pytest-asyncio>=1.4,<2",
+  "ruff>=0.16,<1",
 ]
+
+[project.scripts]
+rpg-engine = "rpg_engine_dnd.cli:main"
+rpg-engine-tui = "rpg_engine_dnd.tui:run_tui"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rpg_engine_dnd"]
@@ -33,13 +41,19 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 target-version = "py312"
-line-length = 100
+line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+select = ["E", "F", "ASYNC"]
+ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"
-strict = true
 packages = ["rpg_engine_dnd"]
 mypy_path = ["src"]
+disallow_untyped_defs = true
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+show_error_codes = true
