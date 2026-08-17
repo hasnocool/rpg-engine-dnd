@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
 import pytest
 
 from rpg_engine_dnd.balancing import BalanceLab, BalanceSample, DirectorCandidate, PredictiveDirector
@@ -15,6 +18,7 @@ from rpg_engine_dnd.knowledge_graph import KnowledgeGraph, KnownFact, Visibility
 from rpg_engine_dnd.lifecycle_features import ResourcePool
 from rpg_engine_dnd.mechanics import Modifier, ModifierOperation, ModifierResolver, ReactionChoice, ReactionStack, ReactionWindow
 from rpg_engine_dnd.orchestration_tree import NodeState, SceneNode, SceneTree
+from rpg_engine_dnd.persistence import AsyncSQLitePlatformStore
 from rpg_engine_dnd.protocol import AreaOfInterest, CommandEnvelope, InterestEntity, InterestManager, validate_expected_revision
 from rpg_engine_dnd.scheduler import ScheduleDomain, SimulationScheduler
 from rpg_engine_dnd.semantic_events import SemanticEventJournal
@@ -178,9 +182,9 @@ def test_content_trust_and_hosting_fence() -> None:
         package_id="pkg", package_version="1.0", content_hash="abc", publisher_id="p",
         capabilities=PackageCapabilityManifest(requested=frozenset({"rules"})), signature_b64="AA==",
     )
-    TrustPolicy(trusted_publishers=frozenset({"p"})).validate(attestation)
+    TrustPolicy(trusted_publishers=frozenset({"p"})).enforce(attestation)
     with pytest.raises(ValueError):
-        TrustPolicy(denied_capabilities=frozenset({"rules"})).validate(attestation)
+        TrustPolicy(denied_capabilities=frozenset({"rules"})).enforce(attestation)
 
     older = LeaseFence(lease_id="l1", worker_id="w", generation=1, fencing_token=1)
     newer = LeaseFence(lease_id="l2", worker_id="w", generation=2, fencing_token=2)
@@ -226,3 +230,20 @@ async def test_durable_shard_fencing_and_idempotency() -> None:
     )
     assert await coordinator.publish(message)
     assert not await coordinator.publish(message)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_compare_and_set_is_atomic(tmp_path: Path) -> None:
+    store = AsyncSQLitePlatformStore(tmp_path / "cas.sqlite")
+    await store.initialize()
+
+    async def claim(value: int) -> bool:
+        return await store.compare_and_set_json("claims", "one", None, {"value": value})
+
+    results = await asyncio.gather(claim(1), claim(2))
+    assert sum(results) == 1
+    current = await store.get_json("claims", "one")
+    assert current in ({"value": 1}, {"value": 2})
+    assert current is not None
+    assert await store.compare_and_set_json("claims", "one", current, {"value": 3})
+    assert await store.get_json("claims", "one") == {"value": 3}
