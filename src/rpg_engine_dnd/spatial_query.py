@@ -5,6 +5,7 @@ from __future__ import annotations
 import heapq
 from math import dist
 from typing import cast
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from .spatial import ContinuousSpace, GraphSpace, GridSpace
@@ -36,11 +37,19 @@ class HexGridSpace(BaseModel):
         return max(abs(aq - bq), abs(ar - br), abs((aq + ar) - (bq + br)))
 
     def path(self, start: tuple[int, int], goal: tuple[int, int], *, budget: float | None = None) -> list[tuple[int, int]]:
-        frontier: list[tuple[float, float, tuple[int, int]]] = [(0, 0, start)]
+        """Find the minimum-cost path with Dijkstra ordering.
+
+        Cell movement costs may be below one, so raw hex distance is not a generally
+        admissible A* heuristic. Cost-only ordering preserves optimality for every
+        positive movement cost supported by ``HexCell``.
+        """
+        frontier: list[tuple[float, tuple[int, int]]] = [(0.0, start)]
         costs = {start: 0.0}
         parents: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
         while frontier:
-            _, current_cost, current = heapq.heappop(frontier)
+            current_cost, current = heapq.heappop(frontier)
+            if current_cost > costs.get(current, float("inf")):
+                continue
             if current == goal:
                 break
             for neighbor in sorted(self.neighbors(current)):
@@ -53,7 +62,7 @@ class HexGridSpace(BaseModel):
                 if new_cost < costs.get(neighbor, float("inf")):
                     costs[neighbor] = new_cost
                     parents[neighbor] = current
-                    heapq.heappush(frontier, (new_cost + self.distance(neighbor, goal), new_cost, neighbor))
+                    heapq.heappush(frontier, (new_cost, neighbor))
         if goal not in parents:
             raise ValueError("no hex path")
         result: list[tuple[int, int]] = []

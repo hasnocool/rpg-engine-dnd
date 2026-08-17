@@ -3,26 +3,35 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from rpg_engine_dnd.balancing import BalanceLab, BalanceSample, DirectorCandidate, PredictiveDirector
 from rpg_engine_dnd.commands import CreateEntity
 from rpg_engine_dnd.compiler_vm import IRInstruction, IROp, RuleIRCompiler
-from rpg_engine_dnd.content_security import ContentAttestation, PackageCapabilityManifest, TrustPolicy
+from rpg_engine_dnd.content_security import (
+    ContentAttestation,
+    PackageCapabilityManifest,
+    PublisherIdentity,
+    TrustPolicy,
+)
 from rpg_engine_dnd.distributed_runtime import DurableMessage, DurableShardCoordinator
 from rpg_engine_dnd.hosting_ops import BackpressureGate, LeaseFence
 from rpg_engine_dnd.intelligence_v2 import GOAPAction, GOAPPlanner
 from rpg_engine_dnd.knowledge_graph import KnowledgeGraph, KnownFact, Visibility
 from rpg_engine_dnd.lifecycle_features import ResourcePool
 from rpg_engine_dnd.mechanics import Modifier, ModifierOperation, ModifierResolver, ReactionChoice, ReactionStack, ReactionWindow
+from rpg_engine_dnd.orchestrator import Scene, SceneStatus, SceneType
 from rpg_engine_dnd.orchestration_tree import NodeState, SceneNode, SceneTree
 from rpg_engine_dnd.persistence import AsyncSQLitePlatformStore
 from rpg_engine_dnd.protocol import AreaOfInterest, CommandEnvelope, InterestEntity, InterestManager, validate_expected_revision
 from rpg_engine_dnd.scheduler import ScheduleDomain, SimulationScheduler
 from rpg_engine_dnd.semantic_events import SemanticEventJournal
-from rpg_engine_dnd.spatial_query import HexGridSpace, SpatialQueryService
+from rpg_engine_dnd.spatial_query import HexCell, HexGridSpace, SpatialQueryService
 from rpg_engine_dnd.world_depth import (
     ClimateProfile,
     FactionGraph,
@@ -133,6 +142,19 @@ def test_hex_spatial_authority() -> None:
     assert path[-1] == (2, -1)
 
 
+def test_hex_spatial_authority_prefers_longer_low_cost_route() -> None:
+    space = HexGridSpace(
+        cells={
+            (1, 0): HexCell(q=1, r=0, movement_cost=2.0),
+            (0, 1): HexCell(q=0, r=1, movement_cost=0.1),
+            (1, 1): HexCell(q=1, r=1, movement_cost=0.1),
+            (2, 0): HexCell(q=2, r=0, movement_cost=0.1),
+        }
+    )
+    path = space.path((0, 0), (2, 0))
+    assert path == [(0, 0), (0, 1), (1, 1), (2, 0)]
+
+
 def test_lifecycle_resource_and_compiler_ir() -> None:
     resource = ResourcePool(resource_id="focus", current=2, maximum=3, short_rest_recovery=1)
     resource.spend()
@@ -177,14 +199,48 @@ def test_balancing_predictive_director_and_knowledge() -> None:
     assert graph.query("dragon", sequence=11)[0].value == "cave"
 
 
+def test_content_trust_requires_valid_signature_when_enabled() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    identity = PublisherIdentity(
+        publisher_id="p",
+        public_key_b64=base64.b64encode(public_key).decode("ascii"),
+    )
+    unsigned = ContentAttestation(
+        package_id="pkg",
+        package_version="1.0",
+        content_hash="abc",
+        publisher_id="p",
+        capabilities=PackageCapabilityManifest(requested=frozenset({"rules"})),
+        signature_b64="",
+    )
+    signature = private_key.sign(unsigned.signed_material())
+    attestation = unsigned.model_copy(
+        update={"signature_b64": base64.b64encode(signature).decode("ascii")}
+    )
+    policy = TrustPolicy(trusted_publishers=frozenset({"p"}))
+    policy.enforce(attestation, identity=identity)
+
+    with pytest.raises(ValueError, match="identity is required"):
+        policy.enforce(attestation)
+    with pytest.raises(ValueError, match="signature verification failed"):
+        policy.enforce(attestation.model_copy(update={"signature_b64": "AA=="}), identity=identity)
+    with pytest.raises(ValueError):
+        TrustPolicy(
+            denied_capabilities=frozenset({"rules"}),
+            require_signature=False,
+        ).enforce(attestation)
+
+
 def test_content_trust_and_hosting_fence() -> None:
     attestation = ContentAttestation(
         package_id="pkg", package_version="1.0", content_hash="abc", publisher_id="p",
         capabilities=PackageCapabilityManifest(requested=frozenset({"rules"})), signature_b64="AA==",
     )
-    TrustPolicy(trusted_publishers=frozenset({"p"})).enforce(attestation)
-    with pytest.raises(ValueError):
-        TrustPolicy(denied_capabilities=frozenset({"rules"})).enforce(attestation)
+    TrustPolicy(trusted_publishers=frozenset({"p"}), require_signature=False).enforce(attestation)
 
     older = LeaseFence(lease_id="l1", worker_id="w", generation=1, fencing_token=1)
     newer = LeaseFence(lease_id="l2", worker_id="w", generation=2, fencing_token=2)
@@ -204,6 +260,35 @@ def test_world_platform_journals_core_commands_atomically() -> None:
     assert engine.snapshot()["journal_head_hash"] == engine.semantic_journal.journal.head_hash
 
 
+def test_world_platform_deduplicates_before_mutation_and_rejects_conflicts() -> None:
+    engine = WorldPlatformEngine(seed=7)
+    command = CreateEntity(command_id="same", entity_id="hero", components={})
+    first = engine.handle(command)
+    second = engine.handle(command)
+
+    assert second == first
+    assert engine.world.revision == 1
+    assert len(engine.semantic_journal.journal.entries) == 1
+    assert engine.semantic_journal.verify()
+
+    with pytest.raises(ValueError, match="reused for a different command"):
+        engine.handle(CreateEntity(command_id="same", entity_id="other", components={}))
+    assert engine.world.revision == 1
+    assert "other" not in engine.world.entities
+
+
+def test_scene_mutations_do_not_break_command_journal_replay() -> None:
+    engine = WorldPlatformEngine(seed=7)
+    engine.orchestrator.register(Scene(scene_id="town", scene_type=SceneType.SETTLEMENT))
+    engine.orchestrator.transition("town", SceneStatus.LOADING)
+    engine.orchestrator.transition("town", SceneStatus.ACTIVE)
+
+    event = engine.handle(CreateEntity(command_id="after-scene", entity_id="hero", components={}))
+    assert event.kind == "entity.created"
+    assert engine.semantic_journal.verify()
+    assert engine.snapshot()["orchestrator"]["active_scene_id"] == "town"
+
+
 class _FakeStore:
     def __init__(self) -> None:
         self.values: dict[tuple[str, str], dict[str, object]] = {}
@@ -213,6 +298,31 @@ class _FakeStore:
 
     async def put_json(self, namespace: str, key: str, value: dict[str, object]) -> None:
         self.values[(namespace, key)] = value
+
+
+class _FailOnceCASStore(_FakeStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_message_write = False
+
+    async def put_json(self, namespace: str, key: str, value: dict[str, object]) -> None:
+        if namespace == "world:message" and not self.failed_message_write:
+            self.failed_message_write = True
+            raise OSError("transient message write failure")
+        await super().put_json(namespace, key, value)
+
+    async def compare_and_set_json(
+        self,
+        namespace: str,
+        key: str,
+        expected: dict[str, object] | None,
+        value: dict[str, object],
+    ) -> bool:
+        current = self.values.get((namespace, key))
+        if current != expected:
+            return False
+        self.values[(namespace, key)] = value
+        return True
 
 
 @pytest.mark.asyncio
@@ -230,6 +340,32 @@ async def test_durable_shard_fencing_and_idempotency() -> None:
     )
     assert await coordinator.publish(message)
     assert not await coordinator.publish(message)
+
+
+@pytest.mark.asyncio
+async def test_durable_publish_recovers_pending_cas_claim_after_io_failure() -> None:
+    store = _FailOnceCASStore()
+    coordinator = DurableShardCoordinator(store)
+    message = DurableMessage(
+        message_id="recover",
+        idempotency_key="recover-key",
+        source_shard="a",
+        target_shard="b",
+        sequence=1,
+        kind="entity.transfer",
+    )
+
+    with pytest.raises(OSError, match="transient"):
+        await coordinator.publish(message)
+    claim = await store.get_json("world:message-idempotency", "recover-key")
+    assert claim is not None and claim["status"] == "pending"
+    assert await store.get_json("world:message", "recover") is None
+
+    assert await coordinator.publish(message)
+    assert not await coordinator.publish(message)
+    assert await store.get_json("world:message", "recover") == message.model_dump(mode="json")
+    final = await store.get_json("world:message-idempotency", "recover-key")
+    assert final is not None and final["status"] == "complete"
 
 
 @pytest.mark.asyncio
