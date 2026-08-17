@@ -11,6 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .dice import DiceStreams
 from .rules import AttackContext, DamageContext, RulesRuntime
+from .scheduler import ScheduleDomain, SimulationScheduler
+from .spatial import GridCell, GridSpace
+from .spatial_query import SpatialQueryService
 
 
 class Position(BaseModel):
@@ -94,16 +97,27 @@ class AttackResult:
 
 
 class CombatSystem:
-    """Deterministic tactical resolver with an authoritative combat clock."""
+    """Deterministic tactical resolver backed by shared rules/spatial/time services when provided."""
 
-    def __init__(self, seed: int | str | bytes, *, rules_runtime: RulesRuntime | None = None) -> None:
+    def __init__(
+        self,
+        seed: int | str | bytes,
+        *,
+        rules_runtime: RulesRuntime | None = None,
+        scheduler: SimulationScheduler | None = None,
+        spatial_queries: SpatialQueryService | None = None,
+        grid_space: GridSpace | None = None,
+    ) -> None:
         self.dice = DiceStreams(seed)
         self.rules_runtime = rules_runtime
+        self.scheduler = scheduler
+        self.spatial_queries = spatial_queries or SpatialQueryService()
+        self.grid_space = grid_space
         self.combatants: dict[str, Combatant] = {}
         self.conditions: dict[str, list[Condition]] = {}
         self.inventories: dict[str, Inventory] = {}
         self.initiative: list[str] = []
-        self.tick = 0
+        self.tick = scheduler.tick if scheduler is not None else 0
         self._queue: list[TimelineAction] = []
         self._order = 0
 
@@ -113,6 +127,11 @@ class CombatSystem:
         self.combatants[combatant.actor_id] = combatant.model_copy(deep=True)
         self.conditions[combatant.actor_id] = []
         self.inventories[combatant.actor_id] = Inventory()
+        if self.grid_space is not None:
+            position = combatant.position
+            if position.z != 0:
+                raise ValueError("GridSpace combat currently requires z=0 positions")
+            self.grid_space.occupy(combatant.actor_id, (position.x, position.y))
 
     def start(self) -> list[str]:
         scores: list[tuple[int, str]] = []
@@ -125,7 +144,7 @@ class CombatSystem:
 
     @staticmethod
     def path(start: Position, goal: Position, *, blocked: Iterable[Position] = ()) -> list[Position]:
-        """Return a deterministic Manhattan path around blocked grid cells."""
+        """Legacy unbounded-grid path helper retained for API compatibility."""
         blocked_set = {(p.x, p.y, p.z) for p in blocked}
         if (goal.x, goal.y, goal.z) in blocked_set:
             raise ValueError("goal is blocked")
@@ -164,7 +183,7 @@ class CombatSystem:
 
     @staticmethod
     def line_of_sight(start: Position, goal: Position, *, blocked: Iterable[Position] = ()) -> bool:
-        """2D Bresenham LOS; the origin and destination themselves do not block sight."""
+        """Legacy Bresenham helper retained for API compatibility."""
         blockers = {(p.x, p.y, p.z) for p in blocked}
         x0, y0, x1, y1 = start.x, start.y, goal.x, goal.y
         dx = abs(x1 - x0)
@@ -186,12 +205,50 @@ class CombatSystem:
                 error += dx
                 y0 += sy
 
+    def authoritative_path(
+        self,
+        start: Position,
+        goal: Position,
+        *,
+        budget: float | None = None,
+        blocked: Iterable[Position] = (),
+    ) -> list[Position]:
+        if self.grid_space is None:
+            return self.path(start, goal, blocked=blocked)
+        if start.z != 0 or goal.z != 0:
+            raise ValueError("GridSpace combat currently requires z=0 positions")
+        space = self.grid_space.model_copy(deep=True)
+        for blocker in blocked:
+            if blocker.z != 0:
+                continue
+            try:
+                cell = space.cell(blocker.x, blocker.y)
+            except ValueError:
+                continue
+            space.cells[(blocker.x, blocker.y)] = cell.model_copy(update={"blocks_movement": True})
+        result = self.spatial_queries.path(
+            space,
+            (start.x, start.y),
+            (goal.x, goal.y),
+            budget=budget,
+        )
+        return [Position(x=coordinate[0], y=coordinate[1]) for coordinate in result]
+
+    def authoritative_line_of_sight(self, start: Position, goal: Position) -> bool:
+        if self.grid_space is None:
+            return self.line_of_sight(start, goal)
+        if start.z != 0 or goal.z != 0:
+            return False
+        return self.spatial_queries.visible(self.grid_space, (start.x, start.y), (goal.x, goal.y))
+
     def move(self, actor_id: str, destination: Position, *, blocked: Iterable[Position] = ()) -> list[Position]:
         actor = self.combatants[actor_id]
-        path = self.path(actor.position, destination, blocked=blocked)
+        path = self.authoritative_path(actor.position, destination, budget=float(actor.speed), blocked=blocked)
         steps = len(path) - 1
-        if steps > actor.speed:
+        if self.grid_space is None and steps > actor.speed:
             raise ValueError("movement budget exceeded")
+        if self.grid_space is not None:
+            self.grid_space.occupy(actor_id, (destination.x, destination.y))
         actor.position = destination
         return path
 
@@ -246,6 +303,15 @@ class CombatSystem:
     def add_condition(self, actor_id: str, condition: Condition) -> None:
         self.conditions[actor_id].append(condition.model_copy(deep=True))
 
+    @staticmethod
+    def _schedule_domain(kind: str) -> ScheduleDomain:
+        lowered = kind.lower()
+        if "spell" in lowered:
+            return ScheduleDomain.SPELL
+        if "condition" in lowered or "effect" in lowered:
+            return ScheduleDomain.CONDITION
+        return ScheduleDomain.TURN
+
     def schedule(self, actor_id: str, kind: str, *, delay_ticks: int, payload: dict[str, object] | None = None) -> TimelineAction:
         if delay_ticks < 0:
             raise ValueError("delay_ticks must be non-negative")
@@ -257,8 +323,32 @@ class CombatSystem:
             kind=kind,
             payload={} if payload is None else dict(payload),
         )
-        heapq.heappush(self._queue, action)
+        if self.scheduler is None:
+            heapq.heappush(self._queue, action)
+        else:
+            scheduled_payload = dict(action.payload)
+            scheduled_payload["combat_order"] = action.order
+            self.scheduler.schedule(
+                f"combat:{action.order}:{actor_id}:{kind}",
+                delay_ticks=delay_ticks,
+                domain=self._schedule_domain(kind),
+                kind=kind,
+                actor_id=actor_id,
+                payload=scheduled_payload,
+            )
         return action
+
+    def _advance_conditions_once(self) -> None:
+        for actor_id, active in self.conditions.items():
+            updated: list[Condition] = []
+            for condition in active:
+                if condition.periodic_damage:
+                    actor = self.combatants[actor_id]
+                    actor.hit_points = max(0, actor.hit_points - condition.periodic_damage)
+                remaining = max(0, condition.rounds_remaining - 1)
+                if remaining:
+                    updated.append(condition.model_copy(update={"rounds_remaining": remaining}))
+            self.conditions[actor_id] = updated
 
     def advance(self, ticks: int = 1) -> list[TimelineAction]:
         if ticks < 0:
@@ -266,20 +356,30 @@ class CombatSystem:
         ready: list[TimelineAction] = []
         for _ in range(ticks):
             self.tick += 1
-            for actor_id, active in self.conditions.items():
-                updated: list[Condition] = []
-                for condition in active:
-                    if condition.periodic_damage:
-                        actor = self.combatants[actor_id]
-                        actor.hit_points = max(0, actor.hit_points - condition.periodic_damage)
-                    remaining = max(0, condition.rounds_remaining - 1)
-                    if remaining:
-                        updated.append(condition.model_copy(update={"rounds_remaining": remaining}))
-                self.conditions[actor_id] = updated
-            while self._queue and self._queue[0].due_tick <= self.tick:
-                ready.append(heapq.heappop(self._queue))
+            self._advance_conditions_once()
+            if self.scheduler is None:
+                while self._queue and self._queue[0].due_tick <= self.tick:
+                    ready.append(heapq.heappop(self._queue))
+                continue
+            scheduled = self.scheduler.advance(1)
+            self.tick = self.scheduler.tick
+            for task in scheduled:
+                order_raw = task.payload.get("combat_order")
+                if task.actor_id is None or not isinstance(order_raw, int):
+                    continue
+                payload = {key: value for key, value in task.payload.items() if key != "combat_order"}
+                ready.append(
+                    TimelineAction(
+                        due_tick=task.due_tick,
+                        order=order_raw,
+                        actor_id=task.actor_id,
+                        kind=task.kind,
+                        payload=payload,
+                    )
+                )
         return ready
 
-    @staticmethod
-    def distance(a: Position, b: Position) -> float:
+    def distance(self, a: Position, b: Position) -> float:
+        if self.grid_space is not None and a.z == 0 and b.z == 0:
+            return self.spatial_queries.distance(self.grid_space, (a.x, a.y), (b.x, b.y))
         return math.dist((a.x, a.y, a.z), (b.x, b.y, b.z))
