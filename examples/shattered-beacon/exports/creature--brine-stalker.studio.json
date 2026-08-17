@@ -1,0 +1,1 @@
+{"schema_version":1,"kind":"creature","item_id":"brine-stalker","content_hash":"b3d2980449b82f373e34cbd265c07886f7c0b472fe58c3190ded7ca9f3a721a4","content":{"creature_id":"brine-stalker","name":"Brine Stalker","stats":{"armor":13,"hp":18,"speed":30,"attack":4},"tags":["coastal","ambusher","beast"]}}
