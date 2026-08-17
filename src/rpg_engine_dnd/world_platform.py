@@ -78,7 +78,7 @@ class WorldPlatformEngine:
         before = self._authoritative_state()
         before_rule_state = deepcopy(self.rule_state)
         try:
-            event = self.runtime.execute(command)
+            event = self.runtime.execute(cast(CommandLike, command))
         except Exception:
             self.rule_state = before_rule_state
             raise
