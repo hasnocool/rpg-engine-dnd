@@ -97,8 +97,15 @@ def test_example_shattered_beacon_project_validates_all_items() -> None:
     }
 
 
-def test_browser_exposes_import_and_export_controls() -> None:
+def test_browser_exposes_import_export_and_selectable_library_controls() -> None:
     assert 'id="importFile"' in BROWSER_HTML
     assert 'id="importItem"' in BROWSER_HTML
-    assert 'id="exportMap"' in BROWSER_HTML
+    assert 'id="exportItem"' in BROWSER_HTML
+    assert 'id="libraryProject"' in BROWSER_HTML
+    assert 'id="loadLibrary"' in BROWSER_HTML
+    assert 'id="libraryItem"' in BROWSER_HTML
+    assert 'id="loadItem"' in BROWSER_HTML
+    assert 'id="itemEditor"' in BROWSER_HTML
+    assert "The Shattered Beacon" in BROWSER_HTML
+    assert "BUNDLED_PROJECTS" in BROWSER_HTML
     assert "Studio item hash verification failed" in BROWSER_HTML
