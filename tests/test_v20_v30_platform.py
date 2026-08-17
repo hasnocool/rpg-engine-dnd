@@ -1,4 +1,3 @@
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
