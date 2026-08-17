@@ -14,7 +14,7 @@ from .engine import SimulationEngine
 from .events import Event
 from .knowledge import KnowledgeAuthority
 from .models import World
-from .orchestrator import CampaignOrchestrator, Scene, SceneStatus
+from .orchestrator import CampaignOrchestrator
 from .rules import RulesRuntime
 from .runtime import AuthoritativeRuntime, CommandBus, CommandLike
 from .scheduler import SimulationScheduler
@@ -56,7 +56,6 @@ class WorldPlatformEngine:
         self._rule_results: dict[str, RuleExecutionResult] = {}
         self._completed_events: dict[str, Event] = {}
         self._command_hashes: dict[str, str] = {}
-        self._scene_command_sequence = 0
 
         self.command_bus = CommandBus()
         for kind in self._CORE_KINDS:
@@ -86,12 +85,17 @@ class WorldPlatformEngine:
         existing = self._completed_events.get(command.command_id)
         if existing is None:
             return None
-        command_hash = self._command_hash(command)
-        if self._command_hashes[command.command_id] != command_hash:
+        if self._command_hashes[command.command_id] != self._command_hash(command):
             raise ValueError("command_id was reused for a different command")
         return existing.model_copy(deep=True)
 
     def handle(self, command: Command | RuleExecuteCommand) -> Event:
+        """Execute and journal a command exactly once per command ID.
+
+        Idempotency is checked before dispatch so a retry cannot mutate live state and
+        then disappear from the event journal. A command ID reused for different input
+        is rejected instead of silently returning an unrelated prior result.
+        """
         completed = self._completed_event(command)
         if completed is not None:
             return completed
@@ -156,51 +160,14 @@ class WorldPlatformEngine:
         )
         return event, result
 
-    def _next_scene_command_id(self, operation: str, scene_id: str) -> str:
-        self._scene_command_sequence += 1
-        return f"scene:{operation}:{scene_id}:{self._scene_command_sequence}"
-
-    def register_scene(self, scene: Scene) -> Scene:
-        before = self._authoritative_state()
-        previous = self.orchestrator.model_copy(deep=True)
-        try:
-            self.orchestrator.register(scene.model_copy(deep=True))
-            after = self._authoritative_state()
-            self.semantic_journal.append(
-                command_id=self._next_scene_command_id("register", scene.scene_id),
-                event_kind="scene.registered",
-                before=before,
-                after=after,
-                data={"scene_id": scene.scene_id},
-            )
-        except Exception:
-            self.orchestrator = previous
-            raise
-        return self.orchestrator.scenes[scene.scene_id].model_copy(deep=True)
-
-    def transition_scene(self, scene_id: str, status: SceneStatus) -> Scene:
-        before = self._authoritative_state()
-        previous = self.orchestrator.model_copy(deep=True)
-        try:
-            scene = self.orchestrator.transition(scene_id, status)
-            after = self._authoritative_state()
-            self.semantic_journal.append(
-                command_id=self._next_scene_command_id(f"transition:{status.value}", scene_id),
-                event_kind="scene.transitioned",
-                before=before,
-                after=after,
-                data={"scene_id": scene_id, "status": status.value},
-            )
-        except Exception:
-            self.orchestrator = previous
-            raise
-        return scene.model_copy(deep=True)
-
     def _authoritative_state(self) -> dict[str, object]:
+        # The semantic journal owns command/rule state. Scene orchestration remains a
+        # separate authority because the hosted scene endpoints intentionally mutate it
+        # outside this command bus; including it here would make legitimate scene edits
+        # invalidate the next journal before-state hash.
         return {
             "world": self.core.world.model_dump(mode="json"),
             "rule_state": deepcopy(self.rule_state),
-            "orchestrator": self.orchestrator.model_dump(mode="json"),
             "scheduler": {
                 "tick": self.scheduler.tick,
                 "pending": [
@@ -219,5 +186,6 @@ class WorldPlatformEngine:
 
     def snapshot(self) -> dict[str, Any]:
         snapshot: dict[str, Any] = self._authoritative_state()
+        snapshot["orchestrator"] = self.orchestrator.model_dump(mode="json")
         snapshot["journal_head_hash"] = self.semantic_journal.journal.head_hash
         return snapshot
