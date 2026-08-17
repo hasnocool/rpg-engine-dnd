@@ -31,15 +31,19 @@ class RuleDebugSession(BaseModel):
         for index, raw in enumerate(trace):
             node_id = str(raw.get("node_id", index))
             state = raw.get("state")
+            raw_inputs = raw.get("inputs")
+            raw_outputs = raw.get("outputs")
             current_state = dict(state) if isinstance(state, dict) else previous_state
+            inputs = dict(raw_inputs) if isinstance(raw_inputs, dict) else {}
+            outputs = dict(raw_outputs) if isinstance(raw_outputs, dict) else {}
             diff = self._diff(previous_state, current_state)
             self.steps.append(
                 DebugStep(
                     index=index,
                     node_id=node_id,
                     operation=str(raw.get("operation", raw.get("op", "unknown"))),
-                    inputs=dict(raw.get("inputs", {})) if isinstance(raw.get("inputs"), dict) else {},
-                    outputs=dict(raw.get("outputs", {})) if isinstance(raw.get("outputs"), dict) else {},
+                    inputs=inputs,
+                    outputs=outputs,
                     state_diff=diff,
                     breakpoint_hit=node_id in self.breakpoints,
                 )
